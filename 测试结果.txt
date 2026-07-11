@@ -1,0 +1,67 @@
+========================================
+ UDS Bootloader Protocol Stack - Tests
+========================================
+[CAN-TP]
+  test_sf_zero_byte           PASS
+  test_sf_max_payload         PASS
+  test_sf_too_long            PASS
+  test_ff_8_bytes             PASS
+  test_ff_4095                PASS
+  test_ff_too_short           PASS
+  test_cf_sn_wrap             PASS
+  test_parse_pci              PASS
+  test_rx_sf                  PASS
+  test_rx_multiframe_20       PASS
+  test_rx_sequence_error      PASS
+  test_tx_single              PASS
+  test_tx_multiframe          PASS
+  test_tx_bs_flowcontrol      PASS
+
+[Security / $27]
+  test_aes_kat                PASS
+  test_seed_key_roundtrip     PASS
+  test_deterministic_seed     PASS
+
+[UDS Application]
+  test_default_session        PASS
+  test_session_switch_extendedPASS
+  test_read_vin               PASS
+  test_read_unknown_did       PASS
+  test_security_in_default_deniedPASS
+  test_security_full_flow     PASS
+  test_security_invalid_key   PASS
+  test_security_key_without_seedPASS
+  test_write_did              PASS
+  test_routine_crc            PASS
+  test_routine_erase          PASS
+  test_programming_flow       PASS
+  test_download_security_deniedPASS
+  test_download_wrong_session PASS
+  test_s3_timeout             PASS
+  test_tester_present_normal  PASS
+  test_tester_present_suppressPASS
+  test_ecu_reset              PASS
+  test_control_dtc            PASS
+  test_comm_control           PASS
+  test_routine_precond        PASS
+
+[CAN-TP + UDS Stack]
+  test_stack_short_request    PASS
+  test_stack_long_response    PASS
+  test_stack_long_request_downloadPASS
+
+[OTA Agent]
+  test_ota_cbc_mac_deterministicPASS
+  test_ota_build_verify_ok    PASS
+  test_ota_verify_tamper      PASS
+  test_ota_verify_bad_magic   PASS
+  test_ota_build_bad_blocksz  PASS
+  test_ota_flash_success      PASS
+  test_ota_flash_sign_fail_no_writePASS
+  test_ota_resume_after_interruptPASS
+
+----------------------------------------
+ RESULT: ALL PASS  (49 tests, 220 assertions)
+----------------------------------------
+
+按回车键退出...

@@ -1,0 +1,81 @@
+<?xml version="1.0"?>
+<Panel Type="Vector.CANalyzer.Panels.PanelSerializer, Vector.CANalyzer.Panels.Serializer, Version=16.8.6.0, Culture=neutral, PublicKeyToken=null">
+  <Object Type="Vector.CANalyzer.Panels.Runtime.Panel, Vector.CANalyzer.Panels.Common, Version=16.8.6.0, Culture=neutral, PublicKeyToken=null" Name="Panel" Children="Controls" ControlName="UDS Bootloader 验证面板">
+    <Object Type="Vector.CANalyzer.Panels.Design.ButtonControl, Vector.CANalyzer.Panels.CommonControls, Version=16.8.6.0, Culture=neutral, PublicKeyToken=null" Name="btnSession" Children="Controls" ControlName="btnSession">
+      <Property Name="Name">btnSession</Property>
+      <Property Name="Size">360, 30</Property>
+      <Property Name="Location">20, 20</Property>
+      <Property Name="BackColor">240, 240, 240</Property>
+      <Property Name="Text">1. 进入扩展会话 ($10 03)</Property>
+      <Property Name="ForeColor">Black</Property>
+      <Property Name="SymbolConfiguration">
+      </Property>
+      <Property Name="TabIndex">0</Property>
+      <Property Name="CAPLEvent">DoSessionExt</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.ButtonControl, Vector.CANalyzer.Panels.CommonControls, Version=16.8.6.0, Culture=neutral, PublicKeyToken=null" Name="btnSecurity" Children="Controls" ControlName="btnSecurity">
+      <Property Name="Name">btnSecurity</Property>
+      <Property Name="Size">360, 30</Property>
+      <Property Name="Location">20, 58</Property>
+      <Property Name="BackColor">240, 240, 240</Property>
+      <Property Name="Text">2. 安全访问解锁 ($27 Seed&amp;Key)</Property>
+      <Property Name="ForeColor">Black</Property>
+      <Property Name="SymbolConfiguration">
+      </Property>
+      <Property Name="TabIndex">1</Property>
+      <Property Name="CAPLEvent">DoSecurity</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.ButtonControl, Vector.CANalyzer.Panels.CommonControls, Version=16.8.6.0, Culture=neutral, PublicKeyToken=null" Name="btnReadVin" Children="Controls" ControlName="btnReadVin">
+      <Property Name="Name">btnReadVin</Property>
+      <Property Name="Size">360, 30</Property>
+      <Property Name="Location">20, 96</Property>
+      <Property Name="BackColor">240, 240, 240</Property>
+      <Property Name="Text">3. 读 VIN ($22 F190)</Property>
+      <Property Name="ForeColor">Black</Property>
+      <Property Name="SymbolConfiguration">
+      </Property>
+      <Property Name="TabIndex">2</Property>
+      <Property Name="CAPLEvent">DoReadVin</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.ButtonControl, Vector.CANalyzer.Panels.CommonControls, Version=16.8.6.0, Culture=neutral, PublicKeyToken=null" Name="btnRoutine" Children="Controls" ControlName="btnRoutine">
+      <Property Name="Name">btnRoutine</Property>
+      <Property Name="Size">360, 30</Property>
+      <Property Name="Location">20, 134</Property>
+      <Property Name="BackColor">240, 240, 240</Property>
+      <Property Name="Text">4. Flash CRC 例程 ($31 01 FF00)</Property>
+      <Property Name="ForeColor">Black</Property>
+      <Property Name="SymbolConfiguration">
+      </Property>
+      <Property Name="TabIndex">3</Property>
+      <Property Name="CAPLEvent">DoRoutineCrc</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.ButtonControl, Vector.CANalyzer.Panels.CommonControls, Version=16.8.6.0, Culture=neutral, PublicKeyToken=null" Name="btnFlash" Children="Controls" ControlName="btnFlash">
+      <Property Name="Name">btnFlash</Property>
+      <Property Name="Size">360, 30</Property>
+      <Property Name="Location">20, 172</Property>
+      <Property Name="BackColor">240, 240, 240</Property>
+      <Property Name="Text">5. 刷写流程 ($10 02 - $34/$36/$37)</Property>
+      <Property Name="ForeColor">Black</Property>
+      <Property Name="SymbolConfiguration">
+      </Property>
+      <Property Name="TabIndex">4</Property>
+      <Property Name="CAPLEvent">DoFlash</Property>
+    </Object>
+    <Object Type="Vector.CANalyzer.Panels.Design.ButtonControl, Vector.CANalyzer.Panels.CommonControls, Version=16.8.6.0, Culture=neutral, PublicKeyToken=null" Name="btnFull" Children="Controls" ControlName="btnFull">
+      <Property Name="Name">btnFull</Property>
+      <Property Name="Size">360, 30</Property>
+      <Property Name="Location">20, 212</Property>
+      <Property Name="BackColor">240, 240, 240</Property>
+      <Property Name="Text">6. 一键全流程验证 (DoFullSequence)</Property>
+      <Property Name="ForeColor">Black</Property>
+      <Property Name="SymbolConfiguration">
+      </Property>
+      <Property Name="TabIndex">5</Property>
+      <Property Name="CAPLEvent">DoFullSequence</Property>
+    </Object>
+    <Property Name="Name">Panel</Property>
+    <Property Name="Size">400, 260</Property>
+    <Property Name="BackColor">White</Property>
+    <Property Name="Panel">Panel</Property>
+  </Object>
+</Panel>

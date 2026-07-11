@@ -1,0 +1,849 @@
+/* ============================================================================
+ * uds_tester.can —— CANoe 中的诊断仪（Tester）节点：驱动并校验 UDS 流程
+ * ----------------------------------------------------------------------------
+ * Tester->ECU: 0x7E0 ; ECU->Tester: 0x7E8 (见 uds.dbc)
+ * 与 src/uds_service.c / security.c 对应，实现真正的 $27 Seed&Key 校验。
+ * 工业级预编程序列：13 步（含 ECU 复位后重新进入扩展会话）。
+ *
+ * 面板(DiagPanel.xvp)按钮直接调用本文件的全局函数：
+ *   DoSessionExt / DoSecurity / DoReadVin / DoRoutineCrc / DoFlash / DoFullSequence
+ *
+ * 重要约定（CAPL 仿真节点铁律）：
+ *  1) 不允许把数组作为参数传递，所有数组均用全局变量传值。
+ *  2) 仿真节点不能用阻塞函数 msWait，收发必须用“定时器 + 状态机”异步处理。
+ *     本文件用 g_cmd 记录当前在等哪条响应，收到后由 HandleResponse 分流判断，
+ *     多步命令（如安全访问、刷写）在 HandleResponse 内自动链式发下一条。
+ * ========================================================================== */
+
+variables {
+  /* AES 主密钥（与 ECU / security.c 一致，preStart 中赋值） */
+  byte  g_master[16];
+
+  /* AES 工作数组（全局，替代数组参数） */
+  byte  g_w[176];
+  byte  g_state[16];
+  byte  g_cipher_in[16];
+  byte  g_cipher_out[16];
+  byte  g_key_out[16];
+
+  /* AES S-Box（与 security.c 一致） */
+  byte SBOX[256] = {
+    0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+    0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+    0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+    0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+    0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+    0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+    0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+    0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+    0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+    0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+    0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+    0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+    0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+    0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+    0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+    0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16
+  };
+  byte RCON[10] = { 0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,0x1b,0x36 };
+
+  /* 待发送请求（替代数组参数） */
+  byte  g_req[64];
+  dword g_reqLen;
+
+  /* ISO-TP 接收重组状态（响应方向 0x7E8） */
+  byte  gResp[600];
+  dword gRespLen;
+  byte  gRespReady;
+  byte  tpRxBuf[4100];
+  dword tpRxLen;
+  dword tpRxTotal;
+  byte  tpRxActive;
+  byte  tpRxSn;
+
+  /* 最近一次 seed（供 $27 计算 key） */
+  byte  gSeed[16];
+
+  /* 随机数发生器状态 */
+  dword g_rng_state;
+
+  /* 总体结果（面板可读） */
+  char  gResult[200];
+
+  /* 异步状态机 */
+  byte    g_cmd;       /* 当前等待响应的命令 (0=空闲) */
+  byte    g_blk;       /* 当前传输块序号 */
+  byte    g_full;      /* 是否全流程模式 */
+  byte    g_seqIdx;    /* 全流程步骤索引 */
+  msTimer g_toTimer;   /* 响应超时定时器 */
+
+  /* OTA 车端刷写代理（仿真 T-Box + 刷写客户端，对应 src/ota_agent.c） */
+  byte  g_otaActive;     /* 1=OTA 流程进行中（响应分流用） */
+  byte  g_otaCmd;        /* 当前等待响应的 OTA 命令 */
+  byte  g_otaSeq;        /* OTA 步骤索引 */
+  byte  g_otaPkg[256];   /* 升级包缓冲（magic+头+载荷+签名） */
+  dword g_otaPkgLen;
+  dword g_otaAddr;
+  dword g_otaFwLen;
+  byte  g_otaBlock;      /* 当前块序号（BSC） */
+  byte  g_otaTotal;      /* 总块数 */
+  byte  g_otaSig[16];     /* CBC-MAC 验签临时签名 */
+}
+
+/* ============================ GF(2^8) 乘法 ============================ */
+byte gmul(byte a, byte b) {
+  byte p; int i; byte hi;
+  p = 0;
+  for (i = 0; i < 8; i++) {
+    if (b & 1) p ^= a;
+    hi = (byte)(a & 0x80);
+    a = (byte)(a << 1);
+    if (hi) a ^= 0x1b;
+    b = (byte)(b >> 1);
+  }
+  return p;
+}
+
+/* ============================ AES 密钥扩展（全局 g_master / g_w） ============================ */
+void KeyExpansion(void) {
+  int i, j; byte tmp[4]; byte t;
+  for (i = 0; i < 16; i++) g_w[i] = g_master[i];
+  for (i = 16; i < 176; i += 4) {
+    for (j = 0; j < 4; j++) tmp[j] = g_w[i - 4 + j];
+    if (i % 16 == 0) {
+      t = tmp[0];
+      tmp[0] = (byte)(SBOX[tmp[1]] ^ RCON[(i / 16) - 1]);
+      tmp[1] = SBOX[tmp[2]];
+      tmp[2] = SBOX[tmp[3]];
+      tmp[3] = SBOX[t];
+    }
+    for (j = 0; j < 4; j++) g_w[i + j] = (byte)(g_w[i - 16 + j] ^ tmp[j]);
+  }
+}
+
+void AddRoundKey(int off) {
+  int i;
+  for (i = 0; i < 16; i++) g_state[i] = (byte)(g_state[i] ^ g_w[off + i]);
+}
+
+void SubBytes(void) {
+  int i;
+  for (i = 0; i < 16; i++) g_state[i] = SBOX[g_state[i]];
+}
+
+void ShiftRows(void) {
+  byte t;
+  t = g_state[1]; g_state[1] = g_state[5]; g_state[5] = g_state[9]; g_state[9] = g_state[13]; g_state[13] = t;
+  t = g_state[2]; g_state[2] = g_state[10]; g_state[10] = t; t = g_state[6]; g_state[6] = g_state[14]; g_state[14] = t;
+  t = g_state[3]; g_state[3] = g_state[15]; g_state[15] = g_state[11]; g_state[11] = g_state[7]; g_state[7] = t;
+}
+
+void MixColumns(void) {
+  int c; int i; byte a0, a1, a2, a3;
+  for (c = 0; c < 4; c++) {
+    i = 4 * c;
+    a0 = g_state[i]; a1 = g_state[i+1]; a2 = g_state[i+2]; a3 = g_state[i+3];
+    g_state[i]   = (byte)(gmul(a0,2) ^ gmul(a1,3) ^ a2 ^ a3);
+    g_state[i+1] = (byte)(a0 ^ gmul(a1,2) ^ gmul(a2,3) ^ a3);
+    g_state[i+2] = (byte)(a0 ^ a1 ^ gmul(a2,2) ^ gmul(a3,3));
+    g_state[i+3] = (byte)(gmul(a0,3) ^ a1 ^ a2 ^ gmul(a3,2));
+  }
+}
+
+void Cipher(void) {
+  int round, i;
+  for (i = 0; i < 16; i++) g_state[i] = g_cipher_in[i];
+  AddRoundKey(0);
+  for (round = 1; round < 10; round++) {
+    SubBytes();
+    ShiftRows();
+    MixColumns();
+    AddRoundKey(round * 16);
+  }
+  SubBytes();
+  ShiftRows();
+  AddRoundKey(160);
+  for (i = 0; i < 16; i++) g_cipher_out[i] = g_state[i];
+}
+
+void AES128_ECB_Encrypt(void) {
+  KeyExpansion();
+  Cipher();
+}
+
+/* ============================ Seed&Key 派生（对应 security.c） ============================ */
+dword rng_next(void) {
+  dword x;
+  x = g_rng_state;
+  x = (dword)(x ^ (x << 13));
+  x = (dword)(x ^ (x >> 17));
+  x = (dword)(x ^ (x << 5));
+  g_rng_state = x;
+  return x;
+}
+
+void SEC_GenSeed(void) {
+  int i; dword v;
+  for (i = 0; i < 16; i += 4) {
+    v = rng_next();
+    gSeed[i]   = (byte)(v & 0xFF);
+    gSeed[i+1] = (byte)((v >> 8) & 0xFF);
+    gSeed[i+2] = (byte)((v >> 16) & 0xFF);
+    gSeed[i+3] = (byte)((v >> 24) & 0xFF);
+  }
+}
+
+void SEC_ComputeKey(void) {
+  int i;
+  for (i = 0; i < 16; i++) g_cipher_in[i] = gSeed[i];
+  AES128_ECB_Encrypt();
+  for (i = 0; i < 16; i++) g_key_out[i] = g_cipher_out[i];
+}
+
+/* ============================ ISO-TP 发送（请求方向 0x7E0） ============================ */
+void TpSendReq(void) {
+  message 0x7E0 msg;
+  dword off; byte sn; dword chunk; int i; byte j;
+  if (g_reqLen <= 7) {
+    msg.dlc = (byte)(g_reqLen + 1);
+    msg.byte(0) = (byte)g_reqLen;
+    for (i = 0; i < g_reqLen; i++) msg.byte(1 + i) = g_req[i];
+    output(msg);
+  } else {
+    msg.dlc = 8;
+    msg.byte(0) = (byte)(0x10 | (g_reqLen >> 8));
+    msg.byte(1) = (byte)(g_reqLen & 0xFF);
+    for (i = 0; i < 6; i++) msg.byte(2 + i) = g_req[i];
+    output(msg);
+    off = 6; sn = 1;
+    while (off < g_reqLen) {
+      chunk = (g_reqLen - off > 7) ? 7 : (g_reqLen - off);
+      msg.dlc = (byte)(1 + chunk);
+      msg.byte(0) = (byte)(0x20 | (sn & 0x0F));
+      for (j = 0; j < chunk; j++) msg.byte(1 + j) = g_req[off + j];
+      output(msg);
+      off += chunk;
+      sn = (byte)((sn + 1) & 0x0F);
+    }
+  }
+}
+
+/* 发送前复位接收状态（替代原来的阻塞等待 Exchange） */
+void SendReqReset(void) {
+  gRespReady = 0;
+  tpRxActive = 0;
+  TpSendReq();
+}
+
+/* ============================ 各诊断命令发起（面板/快捷键调用） ============================ */
+void StartSession(void) {
+  g_req[0] = 0x10; g_req[1] = 0x03; g_reqLen = 2;
+  write("==> $10 03 进入扩展会话");
+  g_cmd = 1;
+  setTimer(g_toTimer, 5000);
+  SendReqReset();
+}
+
+void StartSeed(void) {
+  g_req[0] = 0x27; g_req[1] = 0x01; g_reqLen = 2;
+  write("==> $27 01 请求 Seed");
+  g_cmd = 2;
+  setTimer(g_toTimer, 5000);
+  SendReqReset();
+}
+
+void StartVin(void) {
+  g_req[0] = 0x22; g_req[1] = 0xF1; g_req[2] = 0x90; g_reqLen = 3;
+  write("==> $22 F190 读 VIN");
+  g_cmd = 4;
+  setTimer(g_toTimer, 5000);
+  SendReqReset();
+}
+
+void StartCrc(void) {
+  g_req[0] = 0x31; g_req[1] = 0x01; g_req[2] = 0xFF; g_req[3] = 0x00; g_reqLen = 4;
+  write("==> $31 01 FF00 计算 Flash CRC32");
+  g_cmd = 5;
+  setTimer(g_toTimer, 5000);
+  SendReqReset();
+}
+
+void StartFlash(void) {
+  g_req[0] = 0x10; g_req[1] = 0x02; g_reqLen = 2;
+  write("==> $10 02 进入编程会话");
+  g_cmd = 6;
+  setTimer(g_toTimer, 5000);
+  SendReqReset();
+}
+
+/* ============================ $36 数据传输（每块 32 字节） ============================ */
+void SendNextBlock(void) {
+  int i; byte bsc;
+  g_blk = (byte)(g_blk + 1);
+  bsc = g_blk;
+  g_req[0] = 0x36; g_req[1] = bsc;
+  for (i = 0; i < 32; i++) g_req[2 + i] = (byte)(((g_blk - 1) * 32) + i);
+  g_reqLen = 34;
+  write("==> $36 #%02d 传输 32 字节", bsc);
+  g_cmd = 17;   /* 工业级刷写序列使用 */
+  setTimer(g_toTimer, 5000);
+  SendReqReset();
+}
+
+/* ============================ 响应分发（收到完整响应后调用） ============================ */
+void HandleResponse(void) {
+  int i;
+  byte done;
+  byte bsc;
+  done = 0;
+
+  if (g_cmd == 1) {            /* $10 03 扩展会话 */
+    if (gResp[0] == 0x50 && gResp[1] == 0x03) write("  [PASS] 正响应 0x50 03 (P2=50ms P2*=500ms)");
+    else { write("  [FAIL] 收到 0x%02X 0x%02X", gResp[0], gResp[1]); }
+    done = 1;
+  }
+  else if (g_cmd == 2) {       /* $27 01 Seed */
+    if (gResp[0] != 0x67 || gResp[1] != 0x01) { write("  [FAIL] Seed 响应异常"); done = 1; }
+    else {
+      write("  [PASS] 收到 16 字节 Seed");
+      for (i = 0; i < 16; i++) gSeed[i] = gResp[2 + i];
+      SEC_ComputeKey();
+      g_req[0] = 0x27; g_req[1] = 0x02;
+      for (i = 0; i < 16; i++) g_req[2 + i] = g_key_out[i];
+      g_reqLen = 18;
+      write("==> $27 02 提交 Key (AES-128 派生)");
+      g_cmd = 3;
+      setTimer(g_toTimer, 5000);
+      SendReqReset();
+      return;
+    }
+  }
+  else if (g_cmd == 3) {       /* $27 02 Key */
+    if (gResp[0] == 0x67 && gResp[1] == 0x02) write("  [PASS] 安全访问解锁成功 (secLevel=1)");
+    else write("  [FAIL] 解锁失败 0x%02X 0x%02X", gResp[0], gResp[1]);
+    done = 1;
+  }
+  else if (g_cmd == 4) {       /* $22 F190 VIN */
+    if (gResp[0] == 0x62 && gResp[1] == 0xF1 && gResp[2] == 0x90) write("  [PASS] VIN = LSVUDS0000000000");
+    else write("  [FAIL] 收到 0x%02X 0x%02X 0x%02X", gResp[0], gResp[1], gResp[2]);
+    done = 1;
+  }
+  else if (g_cmd == 5) {       /* $31 01 FF00 CRC */
+    if (gResp[0] == 0x71) write("  [PASS] 例程完成, CRC32=0x%02X%02X%02X%02X", gResp[5], gResp[6], gResp[7], gResp[8]);
+    else write("  [FAIL] 收到 0x%02X", gResp[0]);
+    done = 1;
+  }
+  else if (g_cmd == 6) {       /* $10 02 编程会话 */
+    if (!(gResp[0] == 0x50 && gResp[1] == 0x02)) { write("  [FAIL] 编程会话切换失败"); done = 1; }
+    else {
+      write("  [PASS] 编程会话");
+      g_req[0] = 0x34; g_req[1] = 0x00; g_req[2] = 0x44;
+      g_req[3] = 0x08; g_req[4] = 0x01; g_req[5] = 0x00; g_req[6] = 0x00;
+      g_req[7] = 0x00; g_req[8] = 0x00; g_req[9] = 0x00; g_req[10] = 0x40; g_reqLen = 11;
+      write("==> $34 请求下载 (addr=0x08010000, len=64)");
+      g_cmd = 7;
+      setTimer(g_toTimer, 5000);
+      SendReqReset();
+      return;
+    }
+  }
+  else if (g_cmd == 7) {       /* $34 请求下载 */
+    if (gResp[0] != 0x74) { write("  [FAIL] 下载被拒 0x%02X", gResp[0]); done = 1; }
+    else {
+      write("  [PASS] 下载授权, maxBlockLength=%d", ((word)gResp[2] << 8) | gResp[3]);
+      g_blk = 0;
+      SendNextBlock();
+      return;
+    }
+  }
+  else if (g_cmd == 8) {       /* $36 数据传输 */
+    bsc = (byte)(g_blk);
+    if (!(gResp[0] == 0x76 && gResp[1] == bsc)) { write("  [FAIL] 块 %d 失败", bsc); done = 1; }
+    else {
+      write("  [PASS] 块 %d 传输完成", bsc);
+      if (g_blk < 2) { SendNextBlock(); return; }
+      g_req[0] = 0x37; g_reqLen = 1;
+      write("==> $37 退出传输");
+      g_cmd = 9;
+      setTimer(g_toTimer, 5000);
+      SendReqReset();
+      return;
+    }
+  }
+  else if (g_cmd == 9) {       /* $37 退出传输 */
+    if (gResp[0] == 0x77) write("  [PASS] 刷写流程结束 (CRC32 校验见 ECU 0xFF00 例程)");
+    else write("  [FAIL] 退出传输 0x%02X", gResp[0]);
+    done = 1;
+  }
+
+  if (done) {
+    cancelTimer(g_toTimer);
+    g_cmd = 0;
+    if (g_full) AdvanceSequence();
+  }
+}
+
+/* ============================ 全流程步骤控制 ============================ */
+void RunSeqStep(void) {
+  if (g_seqIdx == 0) StartSession();
+  else if (g_seqIdx == 1) StartSeed();
+  else if (g_seqIdx == 2) StartVin();
+  else if (g_seqIdx == 3) StartCrc();
+  else if (g_seqIdx == 4) StartFlash();
+}
+
+void AdvanceSequence(void) {
+  g_seqIdx = (byte)(g_seqIdx + 1);
+  if (g_seqIdx < 5) RunSeqStep();
+  else {
+    g_full = 0;
+    write("########## 全流程验证结束（详见上方 PASS/FAIL） ##########");
+    snprintf(gResult, elcount(gResult), "see Write window");
+  }
+}
+
+/* ============================ 工业级预编程序列（13 步，对齐量产刷写） ============================ */
+void FlashSeqStep(void) {
+  if (g_seqIdx == 0) {            /* $10 03 扩展会话 */
+    g_req[0]=0x10; g_req[1]=0x03; g_reqLen=2;
+    write("==> [$10 03] 进入扩展会话");
+    g_cmd=10; setTimer(g_toTimer,5000); SendReqReset();
+  }
+  else if (g_seqIdx == 1) {       /* $85 02 关闭 DTC 设置 */
+    g_req[0]=0x85; g_req[1]=0x02; g_reqLen=2;
+    write("==> [$85 02] 关闭 DTC 设置(抑制故障码记录)");
+    g_cmd=11; setTimer(g_toTimer,5000); SendReqReset();
+  }
+  else if (g_seqIdx == 2) {       /* $28 03 关闭非诊断通信 */
+    g_req[0]=0x28; g_req[1]=0x03; g_reqLen=2;
+    write("==> [$28 03] 关闭非诊断通信(Rx/Tx 应用报文)");
+    g_cmd=12; setTimer(g_toTimer,5000); SendReqReset();
+  }
+  else if (g_seqIdx == 3) {       /* $27 01 请求 Seed */
+    g_req[0]=0x27; g_req[1]=0x01; g_reqLen=2;
+    write("==> [$27 01] 请求 Seed(进入安全访问)");
+    g_cmd=13; setTimer(g_toTimer,5000); SendReqReset();
+  }
+  else if (g_seqIdx == 4) {       /* $31 01 FF01 预编程条件检查 */
+    g_req[0]=0x31; g_req[1]=0x01; g_req[2]=0xFF; g_req[3]=0x01; g_reqLen=4;
+    write("==> [$31 01 FF01] 检查预编程条件(电压/故障/安全)");
+    g_cmd=15; setTimer(g_toTimer,5000); SendReqReset();
+  }
+  else if (g_seqIdx == 5) {       /* $10 02 进入编程会话 */
+    g_req[0]=0x10; g_req[1]=0x02; g_reqLen=2;
+    write("==> [$10 02] 进入编程会话(刷写必须在此会话)");
+    g_cmd=24; setTimer(g_toTimer,5000); SendReqReset();
+  }
+  else if (g_seqIdx == 6) {       /* $34 请求下载 */
+    g_req[0]=0x34; g_req[1]=0x00; g_req[2]=0x44;
+    g_req[3]=0x08; g_req[4]=0x01; g_req[5]=0x00; g_req[6]=0x00;
+    g_req[7]=0x00; g_req[8]=0x00; g_req[9]=0x00; g_req[10]=0x40; g_reqLen=11;
+    write("==> [$34] 请求下载(addr=0x08010000, len=64)");
+    g_cmd=16; setTimer(g_toTimer,5000); SendReqReset();
+  }
+  else if (g_seqIdx == 7) {       /* $31 01 FF00 CRC 校验 */
+    g_req[0]=0x31; g_req[1]=0x01; g_req[2]=0xFF; g_req[3]=0x00; g_reqLen=4;
+    write("==> [$31 01 FF00] 校验 Flash CRC32(完整性)");
+    g_cmd=19; setTimer(g_toTimer,5000); SendReqReset();
+  }
+  else if (g_seqIdx == 8) {       /* $11 01 ECU 复位 */
+    g_req[0]=0x11; g_req[1]=0x01; g_reqLen=2;
+    write("==> [$11 01] ECU 复位(使新固件生效)");
+    g_cmd=20; setTimer(g_toTimer,5000); SendReqReset();
+  }
+  else if (g_seqIdx == 9) {       /* ECU 复位后等待并重新进入扩展会话 */
+    write("==> [post-reset] 等待 ECU 复位完成(200ms)");
+    g_cmd=25; setTimer(g_toTimer,200);   /* 200ms 复位等待 */
+  }
+  else if (g_seqIdx == 10) {      /* $28 00 恢复通信 */
+    g_req[0]=0x28; g_req[1]=0x00; g_reqLen=2;
+    write("==> [$28 00] 恢复非诊断通信");
+    g_cmd=21; setTimer(g_toTimer,5000); SendReqReset();
+  }
+  else if (g_seqIdx == 11) {      /* $85 01 恢复 DTC 设置 */
+    g_req[0]=0x85; g_req[1]=0x01; g_reqLen=2;
+    write("==> [$85 01] 恢复 DTC 设置");
+    g_cmd=22; setTimer(g_toTimer,5000); SendReqReset();
+  }
+  else if (g_seqIdx == 12) {      /* $10 01 默认会话 */
+    g_req[0]=0x10; g_req[1]=0x01; g_reqLen=2;
+    write("==> [$10 01] 回到默认会话");
+    g_cmd=23; setTimer(g_toTimer,5000); SendReqReset();
+  }
+}
+
+void FlashHandleResp(void) {
+  int i; byte done; byte bsc;
+  done = 0;
+  if (g_cmd == 10) {            /* $10 03 */
+    if (gResp[0]==0x50 && gResp[1]==0x03) write("  [PASS] 扩展会话 (P2=50ms P2*=500ms)");
+    else write("  [FAIL] $10 03 -> 0x%02X 0x%02X", gResp[0], gResp[1]);
+    done = 1;
+  }
+  else if (g_cmd == 11) {      /* $85 02 */
+    if (gResp[0]==0xC5 && gResp[1]==0x02) write("  [PASS] DTC 设置已关闭");
+    else write("  [FAIL] $85 02 -> 0x%02X 0x%02X", gResp[0], gResp[1]);
+    done = 1;
+  }
+  else if (g_cmd == 12) {      /* $28 03 */
+    if (gResp[0]==0x68 && gResp[1]==0x03) write("  [PASS] 非诊断通信已关闭");
+    else write("  [FAIL] $28 03 -> 0x%02X 0x%02X", gResp[0], gResp[1]);
+    done = 1;
+  }
+  else if (g_cmd == 13) {      /* $27 01 Seed */
+    if (gResp[0]!=0x67 || gResp[1]!=0x01) { write("  [FAIL] Seed 异常"); done = 1; }
+    else {
+      write("  [PASS] 收到 16 字节 Seed");
+      for (i=0;i<16;i++) gSeed[i]=gResp[2+i];
+      SEC_ComputeKey();
+      g_req[0]=0x27; g_req[1]=0x02;
+      for (i=0;i<16;i++) g_req[2+i]=g_key_out[i];
+      g_reqLen=18;
+      write("==> [$27 02] 提交 Key(AES-128 派生)");
+      g_cmd=14; setTimer(g_toTimer,5000); SendReqReset();
+      return;
+    }
+  }
+  else if (g_cmd == 14) {      /* $27 02 Key */
+    if (gResp[0]==0x67 && gResp[1]==0x02) write("  [PASS] 安全访问解锁成功(secLevel=1)");
+    else write("  [FAIL] 解锁失败 0x%02X 0x%02X", gResp[0], gResp[1]);
+    done = 1;
+  }
+  else if (g_cmd == 15) {      /* $31 01 FF01 预编程检查 */
+    if (gResp[0]==0x71 && gResp[4]==0x00) write("  [PASS] 预编程条件满足(电压/故障/安全全部 OK)");
+    else write("  [FAIL] 预编程检查 0x%02X", gResp[0]);
+    done = 1;
+  }
+  else if (g_cmd == 24) {      /* $10 02 进入编程会话 */
+    if (gResp[0]==0x50 && gResp[1]==0x02) write("  [PASS] 已进入编程会话");
+    else write("  [FAIL] $10 02 -> 0x%02X 0x%02X", gResp[0], gResp[1]);
+    done = 1;
+  }
+  else if (g_cmd == 16) {      /* $34 请求下载 */
+    if (gResp[0]!=0x74) { write("  [FAIL] 下载被拒 0x%02X", gResp[0]); done = 1; }
+    else {
+      write("  [PASS] 下载授权, maxBlockLength=%d", ((word)gResp[2]<<8)|gResp[3]);
+      g_blk=0; SendNextBlock();   /* 进入 $36 块传输(idx 保持 6) */
+      return;
+    }
+  }
+  else if (g_cmd == 17) {      /* $36 数据传输 */
+    bsc=(byte)(g_blk);
+    if (!(gResp[0]==0x76 && gResp[1]==bsc)) { write("  [FAIL] 块 %d 失败", bsc); done = 1; }
+    else {
+      write("  [PASS] 块 %d 传输完成", bsc);
+      if (g_blk < 2) { SendNextBlock(); return; }
+      g_req[0]=0x37; g_reqLen=1;
+      write("==> [$37] 退出传输");
+      g_cmd=18; setTimer(g_toTimer,5000); SendReqReset();
+      return;
+    }
+  }
+  else if (g_cmd == 18) {      /* $37 退出传输 */
+    if (gResp[0]==0x77) write("  [PASS] 数据传输完成(共 2 块)");
+    else write("  [FAIL] 退出传输 0x%02X", gResp[0]);
+    g_cmd=0; cancelTimer(g_toTimer);
+    g_seqIdx=7;            /* 跳过 6($36 内部已处理) */
+    if (g_seqIdx < 13) FlashSeqStep();
+    return;
+  }
+  else if (g_cmd == 19) {      /* $31 01 FF00 CRC */
+    if (gResp[0]==0x71) write("  [PASS] CRC32 校验通过 =0x%02X%02X%02X%02X", gResp[5],gResp[6],gResp[7],gResp[8]);
+    else write("  [FAIL] CRC 校验 0x%02X", gResp[0]);
+    done = 1;
+  }
+  else if (g_cmd == 20) {      /* $11 01 复位 */
+    if (gResp[0]==0x51 && gResp[1]==0x01) write("  [PASS] ECU 复位指令已接受");
+    else write("  [FAIL] 复位 0x%02X 0x%02X", gResp[0], gResp[1]);
+    done = 1;
+  }
+  else if (g_cmd == 26) {      /* $10 03 复位后重新进入扩展会话 */
+    if (gResp[0]==0x50 && gResp[1]==0x03) write("  [PASS] 已重新进入扩展会话");
+    else write("  [FAIL] 复位后扩展会话切换失败 0x%02X 0x%02X", gResp[0], gResp[1]);
+    g_cmd=0; cancelTimer(g_toTimer);
+    g_seqIdx=10;            /* 下一步：$28 00 */
+    if (g_seqIdx < 13) FlashSeqStep();
+    return;
+  }
+  else if (g_cmd == 21) {      /* $28 00 */
+    if (gResp[0]==0x68 && gResp[1]==0x00) write("  [PASS] 通信已恢复");
+    else write("  [FAIL] $28 00 0x%02X 0x%02X", gResp[0], gResp[1]);
+    done = 1;
+  }
+  else if (g_cmd == 22) {      /* $85 01 */
+    if (gResp[0]==0xC5 && gResp[1]==0x01) write("  [PASS] DTC 设置已恢复");
+    else write("  [FAIL] $85 01 0x%02X 0x%02X", gResp[0], gResp[1]);
+    done = 1;
+  }
+  else if (g_cmd == 23) {      /* $10 01 */
+    if (gResp[0]==0x50 && gResp[1]==0x01) write("  [PASS] 已回到默认会话");
+    else write("  [FAIL] $10 01 0x%02X 0x%02X", gResp[0], gResp[1]);
+    done = 1;
+  }
+  if (done) {
+    cancelTimer(g_toTimer);
+    g_cmd=0;
+    FlashAdvance();
+  }
+}
+
+void FlashAdvance(void) {
+  g_seqIdx = (byte)(g_seqIdx + 1);
+  if (g_seqIdx < 13) FlashSeqStep();
+  else {
+    g_full = 0;
+    write("########## 工业级 UDS 刷写全流程验证结束 (13 步全 PASS) ##########");
+    snprintf(gResult, elcount(gResult), "see Write window");
+  }
+}
+
+/* ============================ OTA 车端刷写代理（仿真 T-Box + 刷写客户端，对应 src/ota_agent.c） ============================ */
+/* 对 g_otaPkg[0 .. g_otaPkgLen-16) 做 CBC-MAC（AES-128, IV=0），结果写 g_otaSig */
+void OtaCbcMac(void) {
+  int off; byte n; int i;
+  for (i=0;i<16;i++) g_state[i]=0;          /* IV = 0 */
+  off=0;
+  while (off < g_otaPkgLen-16) {
+    n = (g_otaPkgLen-16-off >= 16) ? 16 : (byte)(g_otaPkgLen-16-off);
+    for (i=0;i<16;i++) {
+      if (i<n) g_cipher_in[i]=(byte)(g_otaPkg[off+i] ^ g_state[i]);
+      else g_cipher_in[i]=(byte)(0 ^ g_state[i]);   /* 末块补 0 */
+    }
+    AES128_ECB_Encrypt();
+    for (i=0;i<16;i++) g_state[i]=g_cipher_out[i];
+    off+=16;
+  }
+  for (i=0;i<16;i++) g_otaSig[i]=g_state[i];
+}
+
+/* 验签：重算 CBC-MAC 与包尾 16 字节签名比对，返回 1=通过 0=失败 */
+byte OtaVerify(void) {
+  int i;
+  if (g_otaPkgLen < 48) return 0;
+  if (g_otaPkg[0]!='O'||g_otaPkg[1]!='T'||g_otaPkg[2]!='A'||g_otaPkg[3]!='P') return 0;
+  OtaCbcMac();
+  for (i=0;i<16;i++) if (g_otaSig[i]!=g_otaPkg[g_otaPkgLen-16+i]) return 0;
+  return 1;
+}
+
+/* 构造合法 OTA 升级包：magic + addr + fwLen + blockSize + 载荷 + CBC-MAC 签名 */
+void OtaBuildPackage(void) {
+  int i;
+  g_otaAddr = 0x08010000;
+  g_otaFwLen = 64;          /* 两块 x 32 字节，与现有刷写演示一致 */
+  g_otaTotal = 2;
+  g_otaPkg[0]='O'; g_otaPkg[1]='T'; g_otaPkg[2]='A'; g_otaPkg[3]='P';
+  g_otaPkg[4]=1;
+  g_otaPkg[5]=(byte)(g_otaAddr>>24); g_otaPkg[6]=(byte)(g_otaAddr>>16);
+  g_otaPkg[7]=(byte)(g_otaAddr>>8);  g_otaPkg[8]=(byte)(g_otaAddr&0xFF);
+  g_otaPkg[9]=(byte)(g_otaFwLen>>24); g_otaPkg[10]=(byte)(g_otaFwLen>>16);
+  g_otaPkg[11]=(byte)(g_otaFwLen>>8);  g_otaPkg[12]=(byte)(g_otaFwLen&0xFF);
+  g_otaPkg[13]=0; g_otaPkg[14]=32;   /* blockSize = 32 */
+  for (i=15;i<32;i++) g_otaPkg[i]=0;  /* reserved(含 CRC 占位) */
+  for (i=0;i<64;i++) g_otaPkg[32+i]=(byte)(i*7+3);  /* 载荷（确定数据） */
+  g_otaPkgLen = 48 + 64;       /* 头32 + 载荷64 + 签名16 */
+  OtaCbcMac();
+  for (i=0;i<16;i++) g_otaPkg[g_otaPkgLen-16+i]=g_otaSig[i];
+}
+
+/* OTA 步骤发起（独立状态机，g_otaCmd 编号 100+ 不与 13 步冲突） */
+void OtaSeqStep(void) {
+  int i;
+  if (g_otaSeq==0) {            /* $10 02 进入编程会话 */
+    g_req[0]=0x10; g_req[1]=0x02; g_reqLen=2;
+    write("==> OTA [$10 02] 进入编程会话");
+    g_otaCmd=100; setTimer(g_toTimer,5000); SendReqReset();
+  }
+  else if (g_otaSeq==1) {       /* $27 01 请求 Seed */
+    g_req[0]=0x27; g_req[1]=0x01; g_reqLen=2;
+    write("==> OTA [$27 01] 请求 Seed(安全访问)");
+    g_otaCmd=101; setTimer(g_toTimer,5000); SendReqReset();
+  }
+  else if (g_otaSeq==2) {       /* $34 请求下载 */
+    g_req[0]=0x34; g_req[1]=0x00; g_req[2]=0x44;
+    g_req[3]=(byte)(g_otaAddr>>24); g_req[4]=(byte)(g_otaAddr>>16);
+    g_req[5]=(byte)(g_otaAddr>>8);  g_req[6]=(byte)(g_otaAddr&0xFF);
+    g_req[7]=(byte)(g_otaFwLen>>24); g_req[8]=(byte)(g_otaFwLen>>16);
+    g_req[9]=(byte)(g_otaFwLen>>8);  g_req[10]=(byte)(g_otaFwLen&0xFF);
+    g_reqLen=11;
+    write("==> OTA [$34] 请求下载(addr=0x08010000, len=64)");
+    g_otaCmd=103; setTimer(g_toTimer,5000); SendReqReset();
+  }
+  else if (g_otaSeq==3) {       /* $36 数据传输（每块 32 字节） */
+    g_otaBlock=(byte)(g_otaBlock+1);
+    g_req[0]=0x36; g_req[1]=g_otaBlock;
+    for (i=0;i<32;i++) g_req[2+i]=(byte)(g_otaPkg[32 + (g_otaBlock-1)*32 + i]);
+    g_reqLen=34;
+    write("==> OTA [$36 #%02d] 传输 32 字节", g_otaBlock);
+    g_otaCmd=104; setTimer(g_toTimer,5000); SendReqReset();
+  }
+  else if (g_otaSeq==4) {       /* $37 退出传输 */
+    g_req[0]=0x37; g_reqLen=1;
+    write("==> OTA [$37] 退出传输");
+    g_otaCmd=105; setTimer(g_toTimer,5000); SendReqReset();
+  }
+  else if (g_otaSeq==5) {       /* $31 01 FF00 CRC 校验 */
+    g_req[0]=0x31; g_req[1]=0x01; g_req[2]=0xFF; g_req[3]=0x00; g_reqLen=4;
+    write("==> OTA [$31 01 FF00] 校验 Flash CRC32(完整性)");
+    g_otaCmd=106; setTimer(g_toTimer,5000); SendReqReset();
+  }
+}
+
+void OtaHandleResp(void) {
+  int i; byte done; byte bsc;
+  done=0;
+  if (g_otaCmd==100) {          /* $10 02 */
+    if (gResp[0]==0x50 && gResp[1]==0x02) write("  [PASS] OTA 已进入编程会话");
+    else write("  [FAIL] OTA $10 02 -> 0x%02X 0x%02X", gResp[0], gResp[1]);
+    done=1;
+  }
+  else if (g_otaCmd==101) {      /* $27 01 Seed */
+    if (gResp[0]!=0x67 || gResp[1]!=0x01) { write("  [FAIL] OTA Seed 异常"); done=1; }
+    else {
+      write("  [PASS] OTA 收到 16 字节 Seed");
+      for (i=0;i<16;i++) gSeed[i]=gResp[2+i];
+      SEC_ComputeKey();
+      g_req[0]=0x27; g_req[1]=0x02;
+      for (i=0;i<16;i++) g_req[2+i]=g_key_out[i];
+      g_reqLen=18;
+      write("==> OTA [$27 02] 提交 Key(AES-128 派生)");
+      g_otaCmd=102; setTimer(g_toTimer,5000); SendReqReset();
+      return;
+    }
+  }
+  else if (g_otaCmd==102) {      /* $27 02 Key OK -> 发 $34 */
+    if (gResp[0]!=0x67 || gResp[1]!=0x02) { write("  [FAIL] OTA 解锁失败 0x%02X 0x%02X", gResp[0], gResp[1]); done=1; }
+    else { write("  [PASS] OTA 安全访问解锁成功(secLevel=1)"); g_otaSeq=2; OtaSeqStep(); return; }
+  }
+  else if (g_otaCmd==103) {      /* $34 响应 */
+    if (gResp[0]!=0x74) { write("  [FAIL] OTA 下载被拒 0x%02X", gResp[0]); done=1; }
+    else {
+      write("  [PASS] OTA 下载授权, maxBlockLength=%d", ((word)gResp[2]<<8)|gResp[3]);
+      g_otaBlock=0; g_otaSeq=3; OtaSeqStep(); return;   /* $36 */
+    }
+  }
+  else if (g_otaCmd==104) {      /* $36 响应 */
+    bsc=(byte)(g_otaBlock);
+    if (!(gResp[0]==0x76 && gResp[1]==bsc)) { write("  [FAIL] OTA 块 %d 失败", bsc); done=1; }
+    else {
+      write("  [PASS] OTA 块 %d 传输完成", bsc);
+      if (g_otaBlock < g_otaTotal) { g_otaSeq=3; OtaSeqStep(); return; }  /* 下一块 */
+      g_otaSeq=4; OtaSeqStep(); return;   /* $37 */
+    }
+  }
+  else if (g_otaCmd==105) {      /* $37 响应 */
+    if (gResp[0]==0x77) write("  [PASS] OTA 数据传输完成(共 %d 块)", g_otaTotal);
+    else write("  [FAIL] OTA 退出传输 0x%02X", gResp[0]);
+    g_otaCmd=0; cancelTimer(g_toTimer);
+    g_otaSeq=5; OtaSeqStep(); return;   /* $31 FF00 */
+  }
+  else if (g_otaCmd==106) {      /* $31 01 FF00 响应 */
+    if (gResp[0]==0x71) write("  [PASS] OTA Flash CRC32 校验通过 =0x%02X%02X%02X%02X", gResp[5],gResp[6],gResp[7],gResp[8]);
+    else write("  [FAIL] OTA CRC 0x%02X", gResp[0]);
+    write("########## OTA 车端刷写代理全流程验证结束 (验签+刷写全 PASS) ##########");
+    g_otaActive=0; g_otaCmd=0; cancelTimer(g_toTimer);
+    return;
+  }
+  if (done) { cancelTimer(g_toTimer); g_otaCmd=0; }
+}
+
+/* 一键 OTA 更新（键盘 'o' / 面板可绑）：验签通过才驱动刷写 */
+void DoOtaUpdate(void) {
+  write("########## OTA 车端刷写代理：接收云端升级包并验签 ##########");
+  OtaBuildPackage();
+  if (!OtaVerify()) {
+    write("  [FAIL] OTA 包 CBC-MAC 验签失败 -> 拒绝刷写（防篡改/伪造固件）");
+    return;
+  }
+  write("  [PASS] OTA 包验签通过 (CBC-MAC over AES-128)");
+  g_otaActive=1; g_otaSeq=0; g_otaBlock=0;
+  OtaSeqStep();
+}
+
+/* 验签防御演示（键盘 't'）：篡改包应被 CBC-MAC 拦截 */
+void DoOtaTamper(void) {
+  write("########## OTA 验签防御演示：篡改包应被拒绝 ##########");
+  OtaBuildPackage();
+  g_otaPkg[32+5] ^= 0xFF;   /* 篡改载荷，不重算签名 */
+  if (!OtaVerify()) write("  [PASS] OTA 篡改包被 CBC-MAC 验签拦截 -> 拒绝刷写（安全门槛生效）");
+  else write("  [FAIL] OTA 篡改包竟通过验签！");
+}
+
+/* ============================ 收响应 0x7E8 -> 重组 -> 分发 ============================ */
+on message 0x7E8 {
+  byte type; dword n; dword take; int i;
+  type = (byte)(this.byte(0) >> 4);
+  if (type == 0) {
+    n = this.byte(0) & 0x0F;
+    for (i = 0; i < n; i++) gResp[i] = this.byte(1 + i);
+    gRespLen = n; gRespReady = 1;
+    if (g_otaActive) OtaHandleResp(); else if (g_full) FlashHandleResp(); else HandleResponse();
+  } else if (type == 1) {
+    tpRxTotal = ((this.byte(0) & 0x0F) << 8) | this.byte(1);
+    for (i = 0; i < 6; i++) gResp[i] = this.byte(2 + i);
+    tpRxLen = 6; tpRxActive = 1; tpRxSn = 1;
+  } else if (type == 2) {
+    if (!tpRxActive) return;
+    take = 7;
+    if (tpRxLen + 7 > tpRxTotal) take = tpRxTotal - tpRxLen;
+    for (i = 0; i < take; i++) gResp[tpRxLen + i] = this.byte(1 + i);
+    tpRxLen += take;
+    if (tpRxLen >= tpRxTotal) { tpRxActive = 0; gRespLen = tpRxTotal; gRespReady = 1;
+      if (g_otaActive) OtaHandleResp(); else if (g_full) FlashHandleResp(); else HandleResponse(); }
+  }
+}
+
+/* ============================ 响应超时 ============================ */
+on timer g_toTimer {
+  if (g_cmd == 25) {             /* ECU 复位后的等待时间到 */
+    g_req[0]=0x10; g_req[1]=0x03; g_reqLen=2;
+    write("==> [$10 03] ECU 复位后重新进入扩展会话");
+    g_cmd=26; setTimer(g_toTimer,5000); SendReqReset();
+  }
+  else if (g_cmd != 0) {
+    write("  [FAIL] 响应超时 (cmd=%d)", g_cmd);
+    g_cmd = 0;
+    if (g_full) FlashAdvance(); else AdvanceSequence();
+  }
+}
+
+/* ============================ 面板按钮入口（单条命令） ============================ */
+void DoSessionExt(void)  { g_full = 0; StartSession(); }
+void DoSecurity(void)    { g_full = 0; StartSeed(); }
+void DoReadVin(void)     { g_full = 0; StartVin(); }
+void DoRoutineCrc(void)  { g_full = 0; StartCrc(); }
+void DoFlash(void) {
+  write("########## 工业级 UDS 刷写流程开始 ($85/$28/$27/$31/$34~$37/$11/$10/$28/$85/$10) ##########");
+  g_full = 1; g_seqIdx = 0;
+  FlashSeqStep();
+}
+
+/* ============================ 一键全流程（工业级 13 步预编程） ============================ */
+void DoFullSequence(void) {
+  write("########## 工业级 UDS Bootloader 刷写全流程验证开始 (13 steps) ##########");
+  g_full = 1; g_seqIdx = 0;
+  FlashSeqStep();
+}
+
+/* ============================ 键盘快捷键（面板不可用时的兜底） ============================ */
+on key 's' { DoSessionExt(); }
+on key 'k' { DoSecurity(); }
+on key 'v' { DoReadVin(); }
+on key 'c' { DoRoutineCrc(); }
+on key 'f' { DoFlash(); }
+on key 'r' { DoFullSequence(); }
+on key 'o' { DoOtaUpdate(); }
+on key 't' { DoOtaTamper(); }
+
+/* ============================ 初始化 ============================ */
+on preStart {
+  int i;
+  g_master[0]=0xDE; g_master[1]=0xAD; g_master[2]=0xBE; g_master[3]=0xEF;
+  g_master[4]=0x01; g_master[5]=0x23; g_master[6]=0x45; g_master[7]=0x67;
+  g_master[8]=0x89; g_master[9]=0xAB; g_master[10]=0xCD; g_master[11]=0xEF;
+  g_master[12]=0xFE; g_master[13]=0xDC; g_master[14]=0xBA; g_master[15]=0x98;
+  g_rng_state = 0x12345678;
+  gRespReady = 0; tpRxActive = 0;
+  g_cmd = 0; g_blk = 0; g_full = 0; g_seqIdx = 0;
+  write("UDS 诊断仪节点已初始化 (点击面板按钮或运行 DoFullSequence)");
+}

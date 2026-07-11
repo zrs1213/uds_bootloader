@@ -1,0 +1,609 @@
+/* ============================================================================
+ * uds_ecu.can  —— CANoe 中的 UDS Bootloader ECU 仿真节点（诊断响应侧）
+ * ----------------------------------------------------------------------------
+ * 与 src/uds_service.c 行为一一对应：会话权限 + 安全等级 + 长度三重校验后分发。
+ * Tester->ECU: 0x7E0 ; ECU->Tester: 0x7E8 (见 uds.dbc)
+ *
+ * 本节点在 CANoe 里独立运行，使整个验证工程“开箱即跑”（无需外接真实 ECU）。
+ * 安全算法直接与 Tester 共享同一份 AES（保证 $27 握手可被真实校验）。
+ *
+ * 重要：CAPL 不允许把数组作为参数传递，所有数组均用全局变量传值。
+ * ========================================================================== */
+
+variables {
+  /* 安全算法全局量 */
+  byte  g_master[16];
+  dword g_rng_state;
+
+  /* AES 工作数组（全局，替代数组参数） */
+  byte  g_w[176];
+  byte  g_state[16];
+  byte  g_cipher_in[16];
+  byte  g_cipher_out[16];
+  byte  g_keyOut[16];
+
+  /* AES S-Box（与 security.c 一致） */
+  byte SBOX[256] = {
+    0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+    0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+    0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+    0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+    0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+    0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+    0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+    0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+    0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+    0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+    0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+    0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+    0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+    0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+    0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+    0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16
+  };
+  byte RCON[10] = { 0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,0x1b,0x36 };
+
+  /* NRC 常量（与 nrc.h 一致） */
+  byte NRC_GENERAL_REJECT             = 0x10;
+  byte NRC_SERVICE_NOT_SUPPORTED      = 0x11;
+  byte NRC_SUB_FUNCTION_NOT_SUPPORTED = 0x12;
+  byte NRC_INCORRECT_MESSAGE_LENGTH   = 0x13;
+  byte NRC_CONDITIONS_NOT_CORRECT    = 0x22;
+  byte NRC_REQUEST_SEQUENCE_ERROR     = 0x24;
+  byte NRC_REQUEST_OUT_OF_RANGE       = 0x31;
+  byte NRC_SECURITY_ACCESS_DENIED    = 0x33;
+  byte NRC_INVALID_KEY               = 0x35;
+  byte NRC_EXCEED_NUMBER_OF_ATTEMPTS = 0x36;
+  byte NRC_SERVICE_NOT_SUPPORTED_IN_SESSION = 0x7F;
+
+  /* 固定参数 */
+  dword FLASH_BASE = 0x08010000;
+  dword FLASH_SIZE = 1024;     /* 1 KB 仿真 Flash（演示足够） */
+  byte  DL_BLOCK_MAX = 32;
+  byte  SEC_SEED_LEN = 16;
+  byte  SEC_KEY_LEN  = 16;
+  byte  SEC_MAX_ATTEMPTS = 3;
+  dword S3_SERVER_MS = 5000;
+
+  /* ISO-TP 接收重组状态（请求方向 0x7E0） */
+  byte   tpRxBuf[4100];
+  dword  tpRxLen;
+  dword  tpRxTotal;
+  byte   tpRxActive;
+  byte   tpRxSn;
+
+  /* 请求缓冲（替代数组参数） */
+  byte   g_req[64];
+  dword  g_reqLen;
+
+  /* 响应缓冲 */
+  byte   g_resp[600];
+  dword  gRlen;
+
+  /* 会话 / 安全状态 */
+  byte curSession;     /* 1=默认 2=编程 3=扩展 */
+  byte secLevel;       /* 0=未解锁 1=已解锁 */
+  byte seedValid;
+  byte secAttempts;
+  byte g_lastSeed[16];
+
+  /* 下载传输状态 */
+  byte  dlActive;
+  dword dlAddr;
+  dword dlRemain;
+  byte  dlBsc;
+  dword dlCrc;
+
+  /* 工业级预编程状态 */
+  byte  dtcEnabled;   /* 1=开启DTC设置 0=已关闭($85 02) */
+  byte  commDisabled;  /* 0=通信正常 非0=非诊断通信禁用($28) */
+
+  /* Flash 仿真（RAM 缓冲，先擦后写语义） */
+  byte flash[1024];
+  byte flashErased;
+
+  /* DID 表（与 uds_io.c 一致） */
+  word didId[8];
+  byte didLen[8];
+  byte didWritable[8];
+  byte didData[128];
+
+  /* CRC32 表 */
+  dword crc32Table[256];
+  byte  crc32InitDone;
+
+  /* 工作缓冲 */
+  byte g_didData[16];
+  byte g_secKey[16];
+  byte g_wbuf[16];
+  byte g_fbuf[64];
+  message 0x7E8 fc;   /* ISO-TP flow control frame buffer (must be inside variables block) */
+}
+
+/* ============================ Flash / DID 抽象 ============================ */
+void FlashInit(void) {
+  int i;
+  for (i = 0; i < 1024; i++) flash[i] = 0xFF;
+  flashErased = 1;
+}
+
+byte FlashErase(dword addr, dword len) {
+  dword off; dword i;
+  if (addr < FLASH_BASE) return 1;
+  off = addr - FLASH_BASE;
+  if (off + len > FLASH_SIZE) return 1;
+  for (i = 0; i < len; i++) flash[off + i] = 0xFF;
+  flashErased = 1;
+  return 0;
+}
+
+byte FlashWrite(dword addr, dword len) {
+  dword off; dword i;
+  if (addr < FLASH_BASE) return 1;
+  off = addr - FLASH_BASE;
+  if (off + len > FLASH_SIZE) return 1;
+  for (i = 0; i < len; i++) {
+    if (flash[off + i] != 0xFF) return 2;  /* 未擦除区写入 */
+  }
+  for (i = 0; i < len; i++) flash[off + i] = g_fbuf[i];
+  return 0;
+}
+
+/* 返回 DID 数据长度；0 表示未找到，数据写入 g_didData */
+dword ReadDid(word did) {
+  int i; int j;
+  for (i = 0; i < 8; i++) {
+    if (didId[i] == did && didLen[i] > 0) {
+      for (j = 0; j < didLen[i]; j++) g_didData[j] = didData[i*16+j];
+      return didLen[i];
+    }
+  }
+  return 0;
+}
+
+byte WriteDid(word did, dword len) {
+  int i; int j;
+  for (i = 0; i < 8; i++) {
+    if (didId[i] == did) {
+      if (didWritable[i] == 0) return 2;
+      if (len > 16) return 3;
+      for (j = 0; j < len; j++) didData[i*16+j] = g_wbuf[j];
+      didLen[i] = (byte)len;
+      return 0;
+    }
+  }
+  return 1;
+}
+
+void DidInit(void) {
+  int i;
+  for (i = 0; i < 8; i++) { didId[i] = 0; didLen[i] = 0; didWritable[i] = 0; }
+  /* 0xF190 VIN (只读) */
+  didId[0] = 0xF190; didLen[0] = 16; didWritable[0] = 0;
+  didData[0*16+0]=0x4C; didData[0*16+1]=0x53; didData[0*16+2]=0x56; didData[0*16+3]=0x55;
+  didData[0*16+4]=0x44; didData[0*16+5]=0x53;
+  didData[0*16+6]=0x30; didData[0*16+7]=0x30; didData[0*16+8]=0x30; didData[0*16+9]=0x30;
+  didData[0*16+10]=0x30; didData[0*16+11]=0x30; didData[0*16+12]=0x30; didData[0*16+13]=0x30;
+  didData[0*16+14]=0x30; didData[0*16+15]=0x30;
+  /* 0xF195 ECU 硬件版本 (只读) */
+  didId[1] = 0xF195; didLen[1] = 9; didWritable[1] = 0;
+  didData[1*16+0]=0x42; didData[1*16+1]=0x4C; didData[1*16+2]=0x5F; didData[1*16+3]=0x56;
+  didData[1*16+4]=0x31; didData[1*16+5]=0x2E; didData[1*16+6]=0x30; didData[1*16+7]=0x2E; didData[1*16+8]=0x30;
+  /* 0x0100 Bootloader 软件版本 (只读) */
+  didId[2] = 0x0100; didLen[2] = 7; didWritable[2] = 0;
+  didData[2*16+0]=0x32; didData[2*16+1]=0x30; didData[2*16+2]=0x32; didData[2*16+3]=0x36;
+  didData[2*16+4]=0x2E; didData[2*16+5]=0x30; didData[2*16+6]=0x37;
+  /* 0x0201 标定参数 (可读写，演示 $2E) */
+  didId[3] = 0x0201; didLen[3] = 4; didWritable[3] = 1;
+  didData[3*16+0]=0; didData[3*16+1]=0; didData[3*16+2]=0; didData[3*16+3]=0;
+}
+
+/* ============================ CRC32 (IEEE) ============================ */
+void Crc32Init(void) {
+  int i; dword c; int k;
+  for (i = 0; i < 256; i++) {
+    c = (dword)i;
+    for (k = 0; k < 8; k++)
+      c = (c & 1) ? (0xEDB88320 ^ (c >> 1)) : (c >> 1);
+    crc32Table[i] = c;
+  }
+  crc32InitDone = 1;
+}
+
+dword Crc32Update(dword crc, dword len) {
+  dword i; byte idx;
+  if (!crc32InitDone) Crc32Init();
+  crc = crc ^ 0xFFFFFFFF;
+  for (i = 0; i < len; i++) {
+    idx = (byte)((crc ^ flash[i]) & 0xFF);
+    crc = crc32Table[idx] ^ (crc >> 8);
+  }
+  return crc ^ 0xFFFFFFFF;
+}
+
+/* ============================ AES（与 Tester 一致） ============================ */
+byte gmul(byte a, byte b) {
+  byte p; int i; byte hi;
+  p = 0;
+  for (i = 0; i < 8; i++) {
+    if (b & 1) p ^= a;
+    hi = (byte)(a & 0x80);
+    a = (byte)(a << 1);
+    if (hi) a ^= 0x1b;
+    b = (byte)(b >> 1);
+  }
+  return p;
+}
+
+void KeyExpansion(void) {
+  int i, j; byte tmp[4]; byte t;
+  for (i = 0; i < 16; i++) g_w[i] = g_master[i];
+  for (i = 16; i < 176; i += 4) {
+    for (j = 0; j < 4; j++) tmp[j] = g_w[i - 4 + j];
+    if (i % 16 == 0) {
+      t = tmp[0];
+      tmp[0] = (byte)(SBOX[tmp[1]] ^ RCON[(i / 16) - 1]);
+      tmp[1] = SBOX[tmp[2]];
+      tmp[2] = SBOX[tmp[3]];
+      tmp[3] = SBOX[t];
+    }
+    for (j = 0; j < 4; j++) g_w[i + j] = (byte)(g_w[i - 16 + j] ^ tmp[j]);
+  }
+}
+
+void AddRoundKey(int off) {
+  int i;
+  for (i = 0; i < 16; i++) g_state[i] = (byte)(g_state[i] ^ g_w[off + i]);
+}
+
+void SubBytes(void) {
+  int i;
+  for (i = 0; i < 16; i++) g_state[i] = SBOX[g_state[i]];
+}
+
+void ShiftRows(void) {
+  byte t;
+  t = g_state[1]; g_state[1] = g_state[5]; g_state[5] = g_state[9]; g_state[9] = g_state[13]; g_state[13] = t;
+  t = g_state[2]; g_state[2] = g_state[10]; g_state[10] = t; t = g_state[6]; g_state[6] = g_state[14]; g_state[14] = t;
+  t = g_state[3]; g_state[3] = g_state[15]; g_state[15] = g_state[11]; g_state[11] = g_state[7]; g_state[7] = t;
+}
+
+void MixColumns(void) {
+  int c; int i; byte a0, a1, a2, a3;
+  for (c = 0; c < 4; c++) {
+    i = 4 * c;
+    a0 = g_state[i]; a1 = g_state[i+1]; a2 = g_state[i+2]; a3 = g_state[i+3];
+    g_state[i]   = (byte)(gmul(a0,2) ^ gmul(a1,3) ^ a2 ^ a3);
+    g_state[i+1] = (byte)(a0 ^ gmul(a1,2) ^ gmul(a2,3) ^ a3);
+    g_state[i+2] = (byte)(a0 ^ a1 ^ gmul(a2,2) ^ gmul(a3,3));
+    g_state[i+3] = (byte)(gmul(a0,3) ^ a1 ^ a2 ^ gmul(a3,2));
+  }
+}
+
+void Cipher(void) {
+  int round, i;
+  for (i = 0; i < 16; i++) g_state[i] = g_cipher_in[i];
+  AddRoundKey(0);
+  for (round = 1; round < 10; round++) {
+    SubBytes();
+    ShiftRows();
+    MixColumns();
+    AddRoundKey(round * 16);
+  }
+  SubBytes();
+  ShiftRows();
+  AddRoundKey(160);
+  for (i = 0; i < 16; i++) g_cipher_out[i] = g_state[i];
+}
+
+void AES128_ECB_Encrypt(void) {
+  KeyExpansion();
+  Cipher();
+}
+
+dword rng_next(void) {
+  dword x;
+  x = g_rng_state;
+  x = (dword)(x ^ (x << 13));
+  x = (dword)(x ^ (x >> 17));
+  x = (dword)(x ^ (x << 5));
+  g_rng_state = x;
+  return x;
+}
+
+void SEC_GenSeed(void) {
+  int i; dword v;
+  for (i = 0; i < 16; i += 4) {
+    v = rng_next();
+    g_lastSeed[i]   = (byte)(v & 0xFF);
+    g_lastSeed[i+1] = (byte)((v >> 8) & 0xFF);
+    g_lastSeed[i+2] = (byte)((v >> 16) & 0xFF);
+    g_lastSeed[i+3] = (byte)((v >> 24) & 0xFF);
+  }
+}
+
+void SEC_ComputeKey(void) {
+  int i;
+  for (i = 0; i < 16; i++) g_cipher_in[i] = g_lastSeed[i];
+  AES128_ECB_Encrypt();
+  for (i = 0; i < 16; i++) g_keyOut[i] = g_cipher_out[i];
+}
+
+/* ============================ ISO-TP 发送（响应方向 0x7E8） ============================ */
+void TpSendResp(void) {
+  message 0x7E8 msg;
+  dword off; byte sn; dword chunk; int i;
+  if (gRlen <= 7) {
+    msg.dlc = (byte)(gRlen + 1);
+    msg.byte(0) = (byte)gRlen;
+    for (i = 0; i < gRlen; i++) msg.byte(1 + i) = g_resp[i];
+    output(msg);
+  } else {
+    msg.dlc = 8;
+    msg.byte(0) = (byte)(0x10 | (gRlen >> 8));
+    msg.byte(1) = (byte)(gRlen & 0xFF);
+    for (i = 0; i < 6; i++) msg.byte(2 + i) = g_resp[i];
+    output(msg);
+    off = 6; sn = 1;
+    while (off < gRlen) {
+      chunk = (gRlen - off > 7) ? 7 : (gRlen - off);
+      msg.dlc = (byte)(1 + chunk);
+      msg.byte(0) = (byte)(0x20 | (sn & 0x0F));
+      for (i = 0; i < chunk; i++) msg.byte(1 + i) = g_resp[off + i];
+      output(msg);
+      off += chunk;
+      sn = (byte)((sn + 1) & 0x0F);
+    }
+  }
+}
+
+/* ============================ 负响应构造（用全局 gRlen） ============================ */
+void UdsBuildNeg(byte sid, byte nrc) {
+  g_resp[0] = 0x7F; g_resp[1] = sid; g_resp[2] = nrc; gRlen = 3;
+}
+
+/* ============================ 会话权限 ============================ */
+byte SessionAllowed(byte sid, byte s) {
+  if (sid == 0x10 || sid == 0x11 || sid == 0x22 || sid == 0x3E) return 1;
+  if (sid == 0x27 || sid == 0x2E || sid == 0x31 || sid == 0x28 || sid == 0x85)
+    return (s == 3 || s == 2) ? 1 : 0;
+  if (sid == 0x34 || sid == 0x36 || sid == 0x37)
+    return (s == 2) ? 1 : 0;
+  return 0;
+}
+
+/* ============================ UDS 分发（镜像 uds_service.c） ============================ */
+void UdsDispatch(void) {
+  byte sid; byte sub; byte suppress; word did; dword dlen;
+  byte lfi; byte addr_len; byte size_len; dword need; dword addr; dword size;
+  byte rtype; word rid; dword crc;
+  byte bsc; dword datalen; byte ok;
+  dword out; dword idx; int i;
+
+  gRlen = 0;
+  if (g_reqLen < 1) { UdsBuildNeg(0x00, NRC_INCORRECT_MESSAGE_LENGTH); TpSendResp(); return; }
+
+  sid = g_req[0];
+  if (!SessionAllowed(sid, curSession)) {
+    UdsBuildNeg(sid, NRC_SERVICE_NOT_SUPPORTED_IN_SESSION);
+    TpSendResp(); return;
+  }
+
+  if (sid == 0x10) {                 /* 诊断会话控制 */
+    if (g_reqLen < 2) { UdsBuildNeg(0x10, NRC_INCORRECT_MESSAGE_LENGTH); TpSendResp(); return; }
+    sub = (byte)(g_req[1] & 0x7F);
+    suppress = (byte)(g_req[1] & 0x80);
+    if (sub != 1 && sub != 2 && sub != 3) { UdsBuildNeg(0x10, NRC_SUB_FUNCTION_NOT_SUPPORTED); TpSendResp(); return; }
+    curSession = sub;
+    if (suppress) return;
+    g_resp[0] = 0x50; g_resp[1] = sub; g_resp[2] = 0x00; g_resp[3] = 0x32; g_resp[4] = 0x01; g_resp[5] = 0xF4; gRlen = 6;
+    TpSendResp(); return;
+  }
+
+  if (sid == 0x11) {                 /* ECU 复位 */
+    if (g_reqLen < 2) { UdsBuildNeg(0x11, NRC_INCORRECT_MESSAGE_LENGTH); TpSendResp(); return; }
+    sub = (byte)(g_req[1] & 0x7F);
+    suppress = (byte)(g_req[1] & 0x80);
+    if (sub < 1 || sub > 3) { UdsBuildNeg(0x11, NRC_SUB_FUNCTION_NOT_SUPPORTED); TpSendResp(); return; }
+    if (suppress) return;
+    g_resp[0] = 0x51; g_resp[1] = sub; gRlen = 2;
+    curSession = 1; secLevel = 0;
+    TpSendResp(); return;
+  }
+
+  if (sid == 0x3E) {                 /* TesterPresent */
+    if (g_reqLen < 2) { UdsBuildNeg(0x3E, NRC_INCORRECT_MESSAGE_LENGTH); TpSendResp(); return; }
+    sub = (byte)(g_req[1] & 0x7F);
+    suppress = (byte)(g_req[1] & 0x80);
+    if (sub != 0x00) { UdsBuildNeg(0x3E, NRC_SUB_FUNCTION_NOT_SUPPORTED); TpSendResp(); return; }
+    if (suppress) return;
+    g_resp[0] = 0x7E; g_resp[1] = 0x00; gRlen = 2;
+    TpSendResp(); return;
+  }
+
+  if (sid == 0x85) {                 /* 控制 DTC 设置（刷写前关、刷写后开） */
+    if (g_reqLen < 2) { UdsBuildNeg(0x85, NRC_INCORRECT_MESSAGE_LENGTH); TpSendResp(); return; }
+    sub = (byte)(g_req[1] & 0x7F);
+    if (sub == 0x01) dtcEnabled = 1;
+    else if (sub == 0x02) dtcEnabled = 0;
+    else { UdsBuildNeg(0x85, NRC_SUB_FUNCTION_NOT_SUPPORTED); TpSendResp(); return; }
+    g_resp[0] = 0xC5; g_resp[1] = sub; gRlen = 2;
+    TpSendResp(); return;
+  }
+
+  if (sid == 0x28) {                 /* 通信控制（刷写前关闭非诊断通信） */
+    if (g_reqLen < 2) { UdsBuildNeg(0x28, NRC_INCORRECT_MESSAGE_LENGTH); TpSendResp(); return; }
+    sub = (byte)(g_req[1] & 0x7F);
+    if (sub > 0x03) { UdsBuildNeg(0x28, NRC_SUB_FUNCTION_NOT_SUPPORTED); TpSendResp(); return; }
+    commDisabled = sub;
+    g_resp[0] = 0x68; g_resp[1] = sub; gRlen = 2;
+    TpSendResp(); return;
+  }
+
+  if (sid == 0x22) {                 /* 读 DID（支持多条） */
+    if (g_reqLen < 3 || ((g_reqLen - 1) % 2) != 0) { UdsBuildNeg(0x22, NRC_INCORRECT_MESSAGE_LENGTH); TpSendResp(); return; }
+    out = 1; g_resp[0] = 0x62; idx = 1;
+    while (idx + 1 < g_reqLen) {
+      did = (word)((g_req[idx] << 8) | g_req[idx + 1]);
+      dlen = ReadDid(did);
+      if (dlen == 0) { UdsBuildNeg(0x22, NRC_REQUEST_OUT_OF_RANGE); TpSendResp(); return; }
+      if (out + 2 + dlen > 512) { UdsBuildNeg(0x22, NRC_REQUEST_OUT_OF_RANGE); TpSendResp(); return; }
+      g_resp[out] = (byte)(did >> 8); g_resp[out + 1] = (byte)(did & 0xFF); out += 2;
+      for (i = 0; i < dlen; i++) { g_resp[out] = g_didData[i]; out++; }
+      idx += 2;
+    }
+    gRlen = out; TpSendResp(); return;
+  }
+
+  if (sid == 0x2E) {                 /* 写 DID */
+    if (g_reqLen < 4) { UdsBuildNeg(0x2E, NRC_INCORRECT_MESSAGE_LENGTH); TpSendResp(); return; }
+    did = (word)((g_req[1] << 8) | g_req[2]);
+    dlen = g_reqLen - 3;
+    for (i = 0; i < dlen; i++) g_wbuf[i] = g_req[3 + i];
+    if (WriteDid(did, dlen) == 1) { UdsBuildNeg(0x2E, NRC_REQUEST_OUT_OF_RANGE); TpSendResp(); return; }
+    if (WriteDid(did, dlen) == 2) { UdsBuildNeg(0x2E, NRC_CONDITIONS_NOT_CORRECT); TpSendResp(); return; }
+    if (WriteDid(did, dlen) == 3) { UdsBuildNeg(0x2E, NRC_INCORRECT_MESSAGE_LENGTH); TpSendResp(); return; }
+    g_resp[0] = 0x6E; g_resp[1] = (byte)(did >> 8); g_resp[2] = (byte)(did & 0xFF); gRlen = 3;
+    TpSendResp(); return;
+  }
+
+  if (sid == 0x27) {                 /* 安全访问 Seed&Key */
+    if (g_reqLen < 2) { UdsBuildNeg(0x27, NRC_INCORRECT_MESSAGE_LENGTH); TpSendResp(); return; }
+    sub = (byte)(g_req[1] & 0x7F);
+    suppress = (byte)(g_req[1] & 0x80);
+    if (sub == 0x01) {
+      if (secAttempts >= SEC_MAX_ATTEMPTS) { UdsBuildNeg(0x27, NRC_EXCEED_NUMBER_OF_ATTEMPTS); TpSendResp(); return; }
+      SEC_GenSeed();
+      seedValid = 1;
+      if (suppress) return;
+      g_resp[0] = 0x67; g_resp[1] = 0x01;
+      for (i = 0; i < 16; i++) g_resp[2 + i] = g_lastSeed[i];
+      gRlen = 18; TpSendResp(); return;
+    } else if (sub == 0x02) {
+      if (!seedValid) { UdsBuildNeg(0x27, NRC_REQUEST_SEQUENCE_ERROR); TpSendResp(); return; }
+      if (g_reqLen < 2 + 16) { UdsBuildNeg(0x27, NRC_INCORRECT_MESSAGE_LENGTH); TpSendResp(); return; }
+      for (i = 0; i < 16; i++) g_secKey[i] = g_req[2 + i];
+      SEC_ComputeKey();
+      ok = 1; for (i = 0; i < 16; i++) if (g_keyOut[i] != g_secKey[i]) ok = 0;
+      seedValid = 0;
+      if (ok) { secAttempts = 0; secLevel = 1; g_resp[0] = 0x67; g_resp[1] = 0x02; gRlen = 2; TpSendResp(); return; }
+      else { secAttempts++; UdsBuildNeg(0x27, NRC_INVALID_KEY); TpSendResp(); return; }
+    }
+    UdsBuildNeg(0x27, NRC_SUB_FUNCTION_NOT_SUPPORTED); TpSendResp(); return;
+  }
+
+  if (sid == 0x31) {                 /* 例程控制 */
+    if (g_reqLen < 4) { UdsBuildNeg(0x31, NRC_INCORRECT_MESSAGE_LENGTH); TpSendResp(); return; }
+    rtype = g_req[1];
+    rid = (word)((g_req[2] << 8) | g_req[3]);
+    if (rtype != 0x01 && rtype != 0x02 && rtype != 0x03) { UdsBuildNeg(0x31, NRC_SUB_FUNCTION_NOT_SUPPORTED); TpSendResp(); return; }
+    if (rid == 0xFF00) {
+      crc = Crc32Update(0, FLASH_SIZE);
+      g_resp[0] = 0x71; g_resp[1] = rtype; g_resp[2] = (byte)(rid >> 8); g_resp[3] = (byte)(rid & 0xFF);
+      g_resp[4] = 0x00;
+      g_resp[5] = (byte)(crc >> 24); g_resp[6] = (byte)(crc >> 16); g_resp[7] = (byte)(crc >> 8); g_resp[8] = (byte)(crc & 0xFF);
+      gRlen = 9; TpSendResp(); return;
+    } else if (rid == 0xFF01) {     /* 检查预编程条件 */
+      g_resp[0] = 0x71; g_resp[1] = rtype; g_resp[2] = (byte)(rid >> 8); g_resp[3] = (byte)(rid & 0xFF);
+      g_resp[4] = 0x00;            /* routineStatus: 所有预编程条件满足 */
+      gRlen = 5; TpSendResp(); return;
+    } else if (rid == 0x0201) {
+      FlashErase(FLASH_BASE, FLASH_SIZE);
+      g_resp[0] = 0x71; g_resp[1] = rtype; g_resp[2] = (byte)(rid >> 8); g_resp[3] = (byte)(rid & 0xFF); g_resp[4] = 0x00;
+      gRlen = 5; TpSendResp(); return;
+    }
+    UdsBuildNeg(0x31, NRC_REQUEST_OUT_OF_RANGE); TpSendResp(); return;
+  }
+
+  if (sid == 0x34) {                 /* 请求下载 */
+    if (secLevel == 0) { UdsBuildNeg(0x34, NRC_SECURITY_ACCESS_DENIED); TpSendResp(); return; }
+    if (g_reqLen < 4) { UdsBuildNeg(0x34, NRC_INCORRECT_MESSAGE_LENGTH); TpSendResp(); return; }
+    lfi = g_req[2];
+    addr_len = (byte)((lfi >> 4) & 0x0F);
+    size_len = (byte)(lfi & 0x0F);
+    if (addr_len == 0 || addr_len > 4 || size_len == 0 || size_len > 4) { UdsBuildNeg(0x34, NRC_INCORRECT_MESSAGE_LENGTH); TpSendResp(); return; }
+    need = 3 + addr_len + size_len;
+    if (g_reqLen < need) { UdsBuildNeg(0x34, NRC_INCORRECT_MESSAGE_LENGTH); TpSendResp(); return; }
+    addr = 0; size = 0;
+    for (i = 0; i < addr_len; i++) addr = (addr << 8) | g_req[3 + i];
+    for (i = 0; i < size_len; i++) size = (size << 8) | g_req[3 + addr_len + i];
+    if (addr < FLASH_BASE || (addr + size) > (FLASH_BASE + FLASH_SIZE)) { UdsBuildNeg(0x34, NRC_REQUEST_OUT_OF_RANGE); TpSendResp(); return; }
+    if (FlashErase(addr, size) != 0) { UdsBuildNeg(0x34, NRC_REQUEST_OUT_OF_RANGE); TpSendResp(); return; }
+    dlActive = 1; dlAddr = addr; dlRemain = size; dlBsc = 1; dlCrc = 0;
+    g_resp[0] = 0x74; g_resp[1] = 0x20;
+    g_resp[2] = (byte)(DL_BLOCK_MAX >> 8); g_resp[3] = (byte)(DL_BLOCK_MAX & 0xFF);
+    gRlen = 4; TpSendResp(); return;
+  }
+
+  if (sid == 0x36) {                 /* 数据传输 */
+    if (secLevel == 0) { UdsBuildNeg(0x36, NRC_SECURITY_ACCESS_DENIED); TpSendResp(); return; }
+    if (g_reqLen < 2) { UdsBuildNeg(0x36, NRC_INCORRECT_MESSAGE_LENGTH); TpSendResp(); return; }
+    if (!dlActive) { UdsBuildNeg(0x36, NRC_REQUEST_SEQUENCE_ERROR); TpSendResp(); return; }
+    bsc = g_req[1];
+    if (bsc != dlBsc) { UdsBuildNeg(0x36, NRC_REQUEST_SEQUENCE_ERROR); TpSendResp(); return; }
+    datalen = g_reqLen - 2;
+    if (datalen > dlRemain) datalen = dlRemain;
+    for (i = 0; i < datalen; i++) g_fbuf[i] = g_req[2 + i];
+    if (FlashWrite(dlAddr, datalen) != 0) { UdsBuildNeg(0x36, NRC_GENERAL_REJECT); TpSendResp(); return; }
+    dlCrc = Crc32Update(dlCrc, datalen);
+    dlAddr += datalen; dlRemain -= datalen;
+    dlBsc = (dlBsc == 0xFF) ? 0 : (byte)(dlBsc + 1);
+    g_resp[0] = 0x76; g_resp[1] = bsc; gRlen = 2; TpSendResp(); return;
+  }
+
+  if (sid == 0x37) {                 /* 退出传输 */
+    if (secLevel == 0) { UdsBuildNeg(0x37, NRC_SECURITY_ACCESS_DENIED); TpSendResp(); return; }
+    if (!dlActive) { UdsBuildNeg(0x37, NRC_REQUEST_SEQUENCE_ERROR); TpSendResp(); return; }
+    if (dlRemain != 0) { UdsBuildNeg(0x37, NRC_REQUEST_SEQUENCE_ERROR); TpSendResp(); return; }
+    g_resp[0] = 0x77; gRlen = 1; dlActive = 0; TpSendResp(); return;
+  }
+
+  UdsBuildNeg(sid, NRC_SERVICE_NOT_SUPPORTED); TpSendResp(); return;
+}
+
+/* ============================ 接收 0x7E0（请求） ============================ */
+on message 0x7E0 {
+  byte type; dword n; dword take; dword i;
+  type = (byte)(this.byte(0) >> 4);
+  if (type == 0) {                         /* 单帧 */
+    n = this.byte(0) & 0x0F;
+    g_reqLen = n;
+    for (i = 0; i < n; i++) g_req[i] = this.byte(1 + i);
+    UdsDispatch();
+  } else if (type == 1) {                  /* 首帧 */
+    tpRxTotal = ((this.byte(0) & 0x0F) << 8) | this.byte(1);
+    for (i = 0; i < 6; i++) tpRxBuf[i] = this.byte(2 + i);
+    tpRxLen = 6; tpRxActive = 1; tpRxSn = 1;
+    fc.dlc = 3; fc.byte(0) = 0x30; fc.byte(1) = 0x00; fc.byte(2) = 0x00;
+    output(fc);
+  } else if (type == 2) {                  /* 连续帧 */
+    if (!tpRxActive) return;
+    take = 7;
+    if (tpRxLen + 7 > tpRxTotal) take = tpRxTotal - tpRxLen;
+    for (i = 0; i < take; i++) tpRxBuf[tpRxLen + i] = this.byte(1 + i);
+    tpRxLen += take;
+    if (tpRxLen >= tpRxTotal) {
+      tpRxActive = 0;
+      g_reqLen = tpRxTotal;
+      for (i = 0; i < tpRxTotal; i++) g_req[i] = tpRxBuf[i];
+      UdsDispatch();
+    }
+  }
+}
+
+/* ============================ 初始化 ============================ */
+on preStart {
+  int i;
+  for (i = 0; i < 16; i++) g_master[i] = 0;
+  g_master[0]=0xDE; g_master[1]=0xAD; g_master[2]=0xBE; g_master[3]=0xEF;
+  g_master[4]=0x01; g_master[5]=0x23; g_master[6]=0x45; g_master[7]=0x67;
+  g_master[8]=0x89; g_master[9]=0xAB; g_master[10]=0xCD; g_master[11]=0xEF;
+  g_master[12]=0xFE; g_master[13]=0xDC; g_master[14]=0xBA; g_master[15]=0x98;
+  g_rng_state = 0xCAFEBABE;
+  FlashInit();
+  DidInit();
+  Crc32Init();
+  curSession = 1; secLevel = 0; secAttempts = 0; seedValid = 0;
+  dlActive = 0; dtcEnabled = 1; commDisabled = 0;
+  write("UDS ECU 仿真节点已初始化 (CAN 0x7E0->0x7E8)");
+}

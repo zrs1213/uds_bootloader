@@ -1,0 +1,27 @@
+/* 由 flash_tool.py 生成的 CANoe CAPL 刷写激励脚本 */
+void FlashFirmware(void)
+{
+  message 0x7E0 msg;
+  int i; byte data[8];
+  /* --- RequestDownload (UDS PDU: 34 00 44 08 01 00 00 00 00 00 10) --- */
+  msg.dlc = 8; data = 0x10, 0x0B, 0x34, 0x00, 0x44, 0x08, 0x01, 0x00;
+  for (i=0;i<8;i++) msg.byte(i) = data[i];
+  output(msg); testWaitForTimeout(5);
+  msg.dlc = 8; data = 0x21, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00;
+  for (i=0;i<8;i++) msg.byte(i) = data[i];
+  output(msg); testWaitForTimeout(5);
+  /* --- TransferData#01 (UDS PDU: 36 01 A1 A6 AB B0 B5 BA BF C4 C9 CE D3 D8 DD E2 E7 EC) --- */
+  msg.dlc = 8; data = 0x10, 0x12, 0x36, 0x01, 0xA1, 0xA6, 0xAB, 0xB0;
+  for (i=0;i<8;i++) msg.byte(i) = data[i];
+  output(msg); testWaitForTimeout(5);
+  msg.dlc = 8; data = 0x21, 0xB5, 0xBA, 0xBF, 0xC4, 0xC9, 0xCE, 0xD3;
+  for (i=0;i<8;i++) msg.byte(i) = data[i];
+  output(msg); testWaitForTimeout(5);
+  msg.dlc = 8; data = 0x22, 0xD8, 0xDD, 0xE2, 0xE7, 0xEC, 0x00, 0x00;
+  for (i=0;i<8;i++) msg.byte(i) = data[i];
+  output(msg); testWaitForTimeout(5);
+  /* --- RequestTransferExit (UDS PDU: 37) --- */
+  msg.dlc = 8; data = 0x01, 0x37, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00;
+  for (i=0;i<8;i++) msg.byte(i) = data[i];
+  output(msg); testWaitForTimeout(5);
+}
