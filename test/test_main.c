@@ -15,6 +15,7 @@ void run_security_tests(void);
 void run_uds_tests(void);
 void run_stack_tests(void);
 void run_ota_tests(void);
+void run_doip_tests(void);
 
 int main(void) {
     printf("========================================\n");
@@ -25,6 +26,7 @@ int main(void) {
     run_uds_tests();
     run_stack_tests();
     run_ota_tests();
+    run_doip_tests();
 
     printf("\n----------------------------------------\n");
     if (mu_tests_failed == 0) {

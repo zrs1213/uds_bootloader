@@ -1,10 +1,11 @@
 # UDS Bootloader 协议栈 + 轻量 OTA 调度层（车载诊断自研项目）
 
 > 从零手写的一套**车载 UDS 诊断 + Bootloader 刷写协议栈**，覆盖 ISO 15765-2（CAN-TP）
-> 传输层与 ISO 14229-1（UDS）应用层，并在其上叠加一层**轻量车端 OTA 刷写调度层**
+> 与 **ISO 13400-2（DoIP，UDS over TCP）** 双传输层及 ISO 14229-1（UDS）应用层，
+> 并在其上叠加一层**轻量车端 OTA 刷写调度层**
 > （云端升级包 → CBC-MAC 验签 → 复用 $34/$36/$37 引擎落盘）。项目定位为**秋招车载嵌入式 /
 > 底盘域 UDS 诊断**方向的高含金量自研项目，与底盘域 IBCU 诊断栈实习经历形成互补
-> （实习偏"用 AUTOSAR 工具配 UDS"，本项目偏"手写 UDS 协议栈 + 双通道刷写架构 + OTA 调度"）。
+> （实习偏"用 AUTOSAR 工具配 UDS"，本项目偏"手写 UDS 协议栈 + CAN/以太网双传输 + 双通道刷写架构 + OTA 调度"）。
 
 ---
 
@@ -52,6 +53,14 @@
 - 接收端多帧重组状态机（BS 流控、SN 序列号校验、溢出保护）
 - 发送端分段状态机（STmin 帧间隔、BS 块流控、FC WAIT 等待）
 
+**DoIP（ISO 13400-2 子集，`doip.h/.c`）——同一套 UDS 栈的第二传输层**
+- 8 字节报头编解码 + **TCP 流式解帧器**（粘包/半包切分、坏头逐字节重同步、谎报超长防护）
+- 路由激活状态机（0x0005/0x0006：成功/重复激活/格式拒绝/未知 SA）
+- 诊断消息（0x8001）**先 ACK(0x8002) 后响应**两条报文语义；SA/TA 校验失败回 NACK(0x8003)
+- VIN 车辆识别请求/应答（0x0001/0x0002，68 字节标准载荷布局）与 AliveCheck（0x0007/0x0008）
+- 纯逻辑零 I/O：socket 由 `examples/doip_ecu_tcp.c` 适配层注入，协议层可进 MCU
+- 配套 Python 诊断仪 `tools/doip_client.py`：TCP 全链路演示（激活→解锁→刷写→CRC→复位）
+
 **UDS 应用层（ISO 14229-1）**
 | SID | 服务 | 说明 |
 |-----|------|------|
@@ -90,26 +99,31 @@
 
 ```
 uds_bootloader/
-├── Makefile                 # make test(本机) / make arm(交叉编译)
+├── Makefile                 # make test(本机) / make arm(交叉编译) / make doip-ecu(DoIP演示端)
 ├── src/
 │   ├── types.h              # CAN 报文结构 + 收发/定时器回调抽象
 │   ├── minunit.h            # 极简单元测试框架（零依赖）
 │   ├── can_tp.h/.c          # ISO 15765-2 传输层
+│   ├── doip.h/.c            # 【新增】ISO 13400-2 DoIP 传输层（TCP 解帧/路由激活/ACK-NACK）
 │   ├── security.h/.c        # AES-128-ECB + $27 Seed&Key + CBC-MAC 原语
 │   ├── boot_fsm.h/.c        # 会话状态机 + S3 超时
 │   ├── uds_io.h/.c          # Flash/DID 抽象（Host=RAM 缓冲）
 │   ├── uds_service.h/.c     # UDS 应用层服务分发 + NRC
 │   └── ota_agent.h/.c       # 【新增】车端 OTA 刷写调度层（验签+复用引擎+续传）
+├── examples/
+│   └── doip_ecu_tcp.c       # 【新增】DoIP ECU 演示端（Winsock2 TCP:13400）
 ├── test/
 │   ├── test_main.c          # 测试入口
 │   ├── test_can_tp.c        # CAN-TP 单元测试
+│   ├── test_doip.c          # 【新增】DoIP 单元测试（14 项：解帧/激活/NACK/UDS over DoIP）
 │   ├── test_security.c      # AES KAT + Seed&Key 闭环
 │   ├── test_uds.c           # UDS 服务/NRC/S3 单元测试
 │   ├── test_stack.c         # CAN-TP+UDS 端到端集成测试
 │   └── test_ota.c           # 【新增】OTA 验签/篡改拦截/断点续传（8 项）
 └── tools/
     ├── aes.py               # Python AES-128-ECB
-    ├── uds_client.py        # 诊断仪侧工具 + 闭环演示
+    ├── uds_client.py        # 诊断仪侧工具 + 闭环演示（CAN 链路）
+    ├── doip_client.py       # 【新增】DoIP 诊断仪 + TCP 全链路刷写演示
     ├── flash_tool.py        # HEX→刷写请求 + CAPL 导出
     └── samples/             # 示例固件与生成脚本
 ```
@@ -121,7 +135,7 @@ uds_bootloader/
 ### 4.1 本机运行单元测试（host）
 ```bash
 make test
-# 期望输出：RESULT: ALL PASS (49 tests, 220 assertions)
+# 期望输出：RESULT: ALL PASS (63 tests, 279 assertions)
 ```
 
 ### 4.2 交叉编译校验（证明可在 MCU 目标编译）
@@ -147,6 +161,15 @@ python tools/flash_tool.py tools/samples/sample.hex --capl download.can
   （本机无 CANoe/License，CAPL OTA 代码待用户在自有 CANoe 中编译验证；C 栈与
   CBC-MAC 逻辑已由 `make test` 的 8 项 OTA 单测全覆盖。）
 
+### 4.5 DoIP 双链路演示（本机即可跑）
+```bash
+make doip-ecu                     # 编译 build/doip_ecu.exe
+build/doip_ecu.exe &              # 起 TCP:13400 ECU 演示端
+python tools/doip_client.py --tcp 127.0.0.1   # 诊断仪跑全链路
+# 期望：路由激活 success → 10 02 → 27 解锁 → 31 擦除 → 34/36/37 刷写
+#      → 31 FF00 CRC 与 Python 模型一致 → AliveCheck → 11 01 复位
+```
+
 ---
 
 ## 5. 当前验证状态
@@ -157,15 +180,13 @@ python tools/flash_tool.py tools/samples/sample.hex --capl download.can
 | Python AES-128-ECB vs FIPS-197 向量 | ✅ 一致 | `python tools/aes.py` |
 | Python 端到端闭环（会话+解锁+刷写+回读） | ✅ PASS | `python tools/uds_client.py --demo` |
 | Python 协议栈等价验证（20 项断言） | ✅ **20/20 PASS** | `python tools/run_tests.py`（覆盖 ISO-TP / 会话权限 / NRC 边界 / 刷写闭环 / Seed&Key） |
-| **C 单元测试 `make test` 绿跑** | ✅ **ALL PASS（49 tests / 220 assertions）** | 已在本机 MinGW-w64 gcc 16.1.0 (UCRT) 实测通过；含 8 项 OTA 代理测试（验签/篡改拦截/断点续传）；另修复 `crc32_update` 长度截断缺陷后全绿 |
+| **C 单元测试 `make test` 绿跑** | ✅ **ALL PASS（63 tests / 279 assertions）** | 已在本机 MinGW gcc 16.2 实测通过；含 8 项 OTA 代理测试（验签/篡改拦截/断点续传）与 14 项 DoIP 测试；另修复 `crc32_update` 长度截断缺陷后全绿 |
+| **DoIP TCP 端到端集成（C ECU ↔ Python 诊断仪）** | ✅ **全链路 PASS** | 路由激活/$27 解锁/34-36-37 刷写/整片 CRC32 一致/AliveCheck/复位，见 `DoIP扩展说明.md` §4 |
 | CANoe 实测 | ⏳ 验证平台就绪 | CAPL 激励脚本已由 `flash_tool.py --capl` 生成，license 就绪即可跑；OTA 键盘 `o`/`t` 子流程待用户编译验证 |
 
-> **本机工具链**：通过 `winget download` 从微软 CDN 获取 winlibs gcc 16.1.0（UCRT/posix/seh），
-> 哈希校验通过、解压至 `C:\mingw64`，并把 `C:\mingw64\bin` 加入用户 PATH。
-> 为兼容 MinGW 中 `make`→`cc` 的默认调用，已在 `bin` 下补 `cc.exe` 副本（=gcc），
-> 因此 `make test` / `mingw32-make test` 均可直接绿跑。
-> 在你自己装有 gcc/MinGW 或 CANoe 的电脑上，`make test`（或 `make arm`）一条命令即可绿跑，
-> 无需任何额外改动。
+> **本机工具链**：gcc 16.2 + GNU Make 4.4.1（w64devkit，解压于 `C:\Tools\w64devkit`，
+> 使用前将其 `bin` 加入 PATH）。在你自己装有 gcc/MinGW 或 CANoe 的电脑上，
+> `make test`（或 `make arm` / `make doip-ecu`）一条命令即可绿跑，无需任何额外改动。
 
 ---
 

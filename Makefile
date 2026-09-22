@@ -11,8 +11,9 @@ ARMFLAGS:= -std=c99 -Wall -Wextra -O2 -mcpu=cortex-m4 -mthumb -Isrc
 SRC   := $(wildcard src/*.c)
 TESTS := $(wildcard test/*.c)
 TARGET := build/uds_test
+ECU    := build/doip_ecu.exe
 
-.PHONY: test arm clean
+.PHONY: test arm clean doip-ecu
 
 test: $(TARGET)
 	@echo ""
@@ -21,6 +22,13 @@ test: $(TARGET)
 $(TARGET): $(SRC) $(TESTS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ $(SRC) $(TESTS)
+
+# DoIP ECU 演示：TCP 13400 上跑同一套 UDS 栈（Windows/Winsock2）
+doip-ecu: $(ECU)
+
+$(ECU): $(SRC) examples/doip_ecu_tcp.c
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ $(SRC) examples/doip_ecu_tcp.c -lws2_32
 
 arm:
 	@mkdir -p build/arm
